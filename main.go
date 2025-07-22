@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -142,6 +143,98 @@ func generateUUID() string {
 	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // Variant bits
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
+// ProxyConfig 代理配置结构
+type ProxyConfig struct {
+	URL       string
+	Available bool
+	Direct    bool
+}
+
+// detectProxyConfig 检测并配置代理设置
+func detectProxyConfig() ProxyConfig {
+	config := ProxyConfig{Direct: true}
+
+	// 检查环境变量
+	proxyEnvVars := []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"}
+	for _, envVar := range proxyEnvVars {
+		if proxyURL := os.Getenv(envVar); proxyURL != "" {
+			config.URL = proxyURL
+			config.Direct = false
+			config.Available = testProxyConnection(proxyURL)
+			fmt.Printf("检测到代理配置: %s=%s, 可用性: %v\n", envVar, proxyURL, config.Available)
+			break
+		}
+	}
+
+	// 如果没有环境变量，检查传统的硬编码代理（向后兼容）
+	if config.Direct {
+		legacyProxy := "http://127.0.0.1:9000"
+		if testProxyConnection(legacyProxy) {
+			fmt.Printf("检测到本地代理服务: %s\n", legacyProxy)
+			config.URL = legacyProxy
+			config.Direct = false
+			config.Available = true
+		} else {
+			fmt.Printf("未检测到代理配置，使用直连模式\n")
+		}
+	}
+
+	return config
+}
+
+// testProxyConnection 测试代理连接是否可用
+func testProxyConnection(proxyURL string) bool {
+	parsedURL, err := url.Parse(proxyURL)
+	if err != nil {
+		fmt.Printf("代理URL解析失败: %v\n", err)
+		return false
+	}
+
+	// 尝试连接代理服务器
+	conn, err := net.DialTimeout("tcp", parsedURL.Host, 2*time.Second)
+	if err != nil {
+		fmt.Printf("代理连接测试失败: %v\n", err)
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// createHTTPClient 根据配置创建HTTP客户端
+func createHTTPClient() (*http.Client, error) {
+	config := detectProxyConfig()
+
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+	}
+
+	// 如果配置了代理且可用，使用代理
+	if !config.Direct && config.Available {
+		proxyURL, err := url.Parse(config.URL)
+		if err != nil {
+			return nil, fmt.Errorf("代理URL解析失败: %v", err)
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+		fmt.Printf("使用代理模式: %s\n", config.URL)
+	} else if !config.Direct && !config.Available {
+		// 代理配置了但不可用，打印警告并降级到直连
+		fmt.Printf("警告: 配置的代理 %s 不可用，降级使用直连模式\n", config.URL)
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   60 * time.Second,
+	}, nil
 }
 
 func main() {
@@ -502,17 +595,22 @@ func handleStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest, a
 	proxyReq.Header.Set("Content-Type", "application/json")
 	proxyReq.Header.Set("Accept", "text/event-stream")
 
-	// 发送请求
-	client := &http.Client{Transport: &http.Transport{
-		Proxy: http.ProxyURL(&url.URL{
-			Scheme: "http",
-			Host:   "127.0.0.1:9000",
-		}),
-	}}
+	// 创建HTTP客户端
+	client, err := createHTTPClient()
+	if err != nil {
+		sendErrorEvent(w, flusher, "创建HTTP客户端失败", err)
+		return
+	}
 
+	// 发送请求
 	resp, err := client.Do(proxyReq)
 	if err != nil {
-		sendErrorEvent(w, flusher, "发送流式请求失败", err)
+		// 提供更详细的错误信息和诊断建议
+		errorMsg := fmt.Sprintf("发送流式请求失败: %v", err)
+		if strings.Contains(err.Error(), "connection refused") {
+			errorMsg += "\n建议检查:\n1. 网络连接是否正常\n2. 目标服务器是否可访问\n3. 如使用代理，请确认代理服务正在运行\n4. 可设置 HTTP_PROXY 环境变量或使用直连模式"
+		}
+		sendErrorEvent(w, flusher, errorMsg, nil)
 		return
 	}
 	defer resp.Body.Close()
@@ -661,18 +759,24 @@ func handleNonStreamRequest(w http.ResponseWriter, anthropicReq AnthropicRequest
 	proxyReq.Header.Set("Authorization", "Bearer "+accessToken)
 	proxyReq.Header.Set("Content-Type", "application/json")
 
-	// 发送请求
-	client := &http.Client{Transport: &http.Transport{
-		Proxy: http.ProxyURL(&url.URL{
-			Scheme: "http",
-			Host:   "127.0.0.1:9000",
-		}),
-	}}
+	// 创建HTTP客户端
+	client, err := createHTTPClient()
+	if err != nil {
+		fmt.Printf("错误: 创建HTTP客户端失败: %v\n", err)
+		http.Error(w, fmt.Sprintf("创建HTTP客户端失败: %v", err), http.StatusInternalServerError)
+		return
+	}
 
+	// 发送请求
 	resp, err := client.Do(proxyReq)
 	if err != nil {
-		fmt.Printf("错误: 发送请求失败: %v\n", err)
-		http.Error(w, fmt.Sprintf("发送请求失败: %v", err), http.StatusInternalServerError)
+		// 提供更详细的错误信息和诊断建议
+		errorMsg := fmt.Sprintf("发送请求失败: %v", err)
+		if strings.Contains(err.Error(), "connection refused") {
+			errorMsg += "\n建议检查:\n1. 网络连接是否正常\n2. 目标服务器是否可访问\n3. 如使用代理，请确认代理服务正在运行\n4. 可设置 HTTP_PROXY 环境变量或使用直连模式"
+		}
+		fmt.Printf("错误: %s\n", errorMsg)
+		http.Error(w, errorMsg, http.StatusInternalServerError)
 		return
 	}
 	defer resp.Body.Close()
@@ -785,11 +889,18 @@ func sendSSEEvent(w http.ResponseWriter, flusher http.Flusher, eventType string,
 
 // sendErrorEvent 发送错误事件
 func sendErrorEvent(w http.ResponseWriter, flusher http.Flusher, message string, err error) {
+	var finalMessage string
+	if err != nil {
+		finalMessage = fmt.Sprintf("%s: %v", message, err)
+	} else {
+		finalMessage = message
+	}
+
 	errorResp := map[string]any{
 		"type": "error",
 		"error": map[string]any{
 			"type":    "server_error",
-			"message": fmt.Sprintf("%s: %v", message, err),
+			"message": finalMessage,
 		},
 	}
 	sendSSEEvent(w, flusher, "error", errorResp)
